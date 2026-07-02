@@ -243,6 +243,37 @@ def test_renders_sensitivity_matrix_as_markdown_table():
     assert "54,518" in md  # a matrix cell from blend_grid
 
 
+def test_ev_ebitda_sensitivity_matches_rounded_matrix_keys():
+    val = _sample_valuation()
+    val["sensitivity"]["ev_ebitda"] = {
+        "ebitda_range": [103.8],
+        "multiple_range": [7.0],
+        "matrix": {"104": {"7.0": {"price": 10220.0}}},
+        "unit": "VND/share",
+    }
+
+    md = _build(valuation=val)
+
+    assert "10,220" in md
+
+
+def test_all_null_sensitivity_grid_renders_explicit_no_valid_cells_note():
+    val = _sample_valuation()
+    val["sensitivity"] = {
+        "simplified_dcf": {
+            "wacc_range": [0.08],
+            "g_range": [0.02],
+            "matrix": {"0.080": {"0.02": None}},
+            "unit": "VND/share",
+        }
+    }
+
+    md = _build(valuation=val)
+
+    assert "Không có ô định giá hợp lệ" in md
+    assert "| 8.0% |" not in md
+
+
 def test_forecast_section_renders_full_income_statement_waterfall():
     md = _build()
 
@@ -258,6 +289,19 @@ def test_forecast_section_renders_full_income_statement_waterfall():
     assert "| Khấu hao (D&A) | 150 | 160 |" in md
     assert "| CAPEX | -200 | -220 |" in md
     assert "| EPS (VND) | 6,000 | 6,500 |" in md
+
+
+def test_workings_hydrates_forecast_from_valuation_when_argument_is_empty():
+    val = _sample_valuation()
+    val["forecast"] = _sample_forecast()
+
+    md = _build(valuation=val, forecast={})
+
+    assert "## 4. Dự phóng theo yếu tố dẫn dắt" in md
+    assert "## 5. Chỉ số tài chính" in md
+    assert "| Doanh thu thuần | 5,000 | 5,500 |" in md
+    assert "| Biên EBIT | EBIT / doanh thu | 24.0% | 23.6% |" in md
+    assert "Chưa có bảng dự phóng" not in md
 
 
 def test_forecast_section_explains_positive_gross_profit_with_negative_ebit():
@@ -494,8 +538,120 @@ def test_report_explanation_embeds_full_valuation_workings():
     assert "0.60" in md and "0.40" in md
     assert "54,518" in md
     assert "P/E" in md
-    assert "Mã băm tái lập" in md
-    assert "abc123" in md
+    assert "Mã băm tái lập" not in md
+    assert "abc123" not in md
+    assert "run_dhg_001" not in md
+    assert "snap-DHG-001" not in md
+
+
+def test_report_explanation_hydrates_forecast_from_valuation_when_argument_is_empty():
+    val = _sample_valuation()
+    val["forecast"] = _sample_forecast()
+
+    md = _build_explanation(valuation=val, forecast={})
+
+    assert "## Vì sao báo cáo chính kết luận như vậy" in md
+    assert "| Doanh thu năm đầu dự phóng | 5,000 |" in md
+    assert "| Doanh thu năm cuối dự phóng | 5,500 |" in md
+    assert "| LNST năm đầu dự phóng | 900 |" in md
+    assert "| LNST năm cuối dự phóng | 980 |" in md
+    assert "| Doanh thu thuần | 5,000 | 5,500 |" in md
+    assert "| Biên lợi nhuận ròng | lợi nhuận sau thuế / doanh thu | 18.0% | 17.8% |" in md
+    assert "Không có dữ liệu dự phóng" not in md
+    assert "Chưa có bảng dự phóng" not in md
+
+
+def test_report_explanation_uses_artifact_fallbacks_for_agp_like_summary_tables():
+    val = _sample_valuation()
+    val.pop("current_price", None)
+    val.pop("target_price", None)
+    val.pop("upside_downside", None)
+    val.pop("valuation_date", None)
+    val.pop("base_year", None)
+    val["snapshot_as_of"] = "2026-07-01"
+    val["period_scope"] = {"to_year": 2025}
+    val["current_price_vnd"] = 35600.0
+    val["blend_dcf"] = {
+        "price_fcff_vnd": None,
+        "price_fcfe_vnd": 23486.0,
+        "fcff_weight": 0.6,
+        "fcfe_weight": 0.4,
+        "target_price_dcf_vnd": 23486.0,
+        "current_price_vnd": 35600.0,
+        "upside_pct": -0.3403,
+        "is_draft_only": False,
+    }
+    val.pop("blend", None)
+    val["pe_forward"] = {
+        "target_pe": 18.3,
+        "eps_fy1_vnd": 141.0,
+        "price_pe_forward_vnd": 2582.0,
+        "peer_data_source": "vnstock: 10 VN pharma peers (price/EPS, EV/EBITDA)",
+    }
+    val["sensitivity"] = {
+        "fcff_wacc_g": {
+            "wacc_range": [0.095],
+            "g_range": [0.03],
+            "matrix": {"0.095": {"0.03": None}},
+            "warnings": [
+                "SG&A historical median did not reconcile to operating EBIT; using pure operating EBIT margin (3.2%) back-solved from operating_profit minus financial income/expense.",
+                "CAPEX/revenue forecast starts from recent level 11.1% instead of full-history median 12.9%; then tapers to maintenance D&A.",
+                "[DebtSchedule] Debt forecast uses CFS-corroborated leverage path (debt held at 74.8% of revenue); net borrowing tracks business growth (FCFE publishable).",
+                "Cost of debt not derivable from debt schedule (no historical interest/debt pairs). Falling back to interest_expense/revenue ratio as proxy. Interest expense confidence: low.",
+                "[WorkingCapital] AGP: no historical inventory data — inventory forecast will be 0",
+                "[WorkingCapital] AGP: no historical AP data — AP forecast will be 0 (delta_nwc may be overstated)",
+                "[CashSweep] CashSweepArtifact: no reported_ending_cash supplied — reconciliation not verifiable; status = pending.",
+            ],
+        }
+    }
+    val["assumption_gate"] = {"recommendation_allowed": False}
+    val["forecast"] = _sample_forecast()
+
+    md = _build_explanation(valuation=val, forecast={}, view_model=None)
+
+    assert "| Ngày định giá | 2026-07-01 |" in md
+    assert "| Năm gốc | 2025 |" in md
+    assert "| Giá hiện tại (VND) | 35,600 |" in md
+    assert "| Giá mục tiêu kết hợp (VND) | 23,486 |" in md
+    assert "| Tiềm năng tăng/giảm | -34.0% |" in md
+    assert "| Khuyến nghị | Chưa công bố - cần phê duyệt của chuyên viên phân tích |" in md
+    assert "| Giá thị trường dùng trong báo cáo | 35,600 |" in md
+    assert "| Giá mục tiêu tính được | 23,486 |" in md
+    assert "| Giá trị theo FCFE | 23,486 |" in md
+    assert "| Giá theo FCFE (VND) | 23,486 |" in md
+    assert "| = Giá mục tiêu kết hợp (VND) | 23,486 |" in md
+    assert "| EPS dự phóng (VND) | 141 |" in md
+    assert "| P/E trung vị nhóm so sánh | 18.3x |" in md
+    assert "| P/E mục tiêu | 18.3x |" in md
+    assert "| Giá mục tiêu (VND) | 2,582 |" in md
+    assert "SG&A historical median" not in md
+    assert "CAPEX/revenue forecast" not in md
+    assert "Debt forecast uses CFS" not in md
+    assert "Cost of debt not derivable" not in md
+    assert "WorkingCapital" not in md
+    assert "CashSweep" not in md
+    assert "Biên chi phí bán hàng và quản lý lịch sử" in md
+    assert "Tỷ lệ CAPEX/doanh thu dự phóng" in md
+    assert "Lịch nợ vay dự phóng" in md
+    assert "Không suy ra được chi phí nợ trực tiếp" in md
+
+
+def test_report_explanation_explains_truly_missing_forecast_without_raw_identifiers():
+    md = build_report_explanation_md(
+        ticker="DHG",
+        run_id="run_dhg_001",
+        valuation={},
+        forecast={},
+        facts={},
+        view_model=None,
+    )
+
+    assert "Chưa có bảng dự phóng theo yếu tố dẫn dắt trong bộ dữ liệu đầu vào" in md
+    assert "Chưa có bảng dự phóng theo yếu tố dẫn dắt để tính chỉ số tài chính" in md
+    assert "Không có dữ liệu dự phóng" not in md
+    assert "artifact" not in md.lower()
+    assert "run_dhg_001" not in md
+    assert "reproducibility_hash" not in md
 
 
 def test_report_explanation_surfaces_data_and_method_warnings():
@@ -504,9 +660,9 @@ def test_report_explanation_surfaces_data_and_method_warnings():
     assert "Lịch nợ vay chưa đủ" in md
     assert "Hai phương pháp dòng tiền" in md
     assert "Giá trị theo FCFF và FCFE lệch trên 25%" in md
-    assert "Số vết công thức" in md
-    assert "VN pharma peers: IMP, DMC, TRA" in md
-    assert "served from cache; live fetch failed" in md
+    assert "Số bước tính có thể đối chiếu" in md
+    assert "Nhóm doanh nghiệp dược Việt Nam: IMP, DMC, TRA" in md
+    assert "Dữ liệu thị trường được lấy từ bản lưu tạm thời" in md
 
 
 def test_report_explanation_translates_policy_blockers_and_mapping_warnings():
@@ -554,14 +710,69 @@ def test_report_explanation_translates_user_facing_finance_terms():
         "Cost of equity",
         "Premium/Discount",
         "driver-based",
+        "projection unreliable",
+        "Terminal value weight",
+        "sensitivity analysis required",
         "sensitivity",
         "reproducibility_hash",
         "Lineage:",
         "canonical facts",
         "artifact định giá",
+        "Mã lần chạy",
+        "Mã ảnh chụp dữ liệu",
+        "Mã băm tái lập",
         "Lý do chặn công bố",
         "recommendation_gate_not_allowed",
         "valuation_result_not_publishable",
         "peer_data_source",
+        "run_dhg_001",
+        "snap-DHG-001",
+        "abc123",
     ]:
         assert english_term not in md
+
+
+def test_standalone_workings_keeps_internal_traceability_metadata():
+    md = _build()
+
+    assert "Mã lần chạy" in md
+    assert "Mã ảnh chụp dữ liệu" in md
+    assert "Mã băm tái lập" in md
+    assert "run_dhg_001" in md
+    assert "snap-DHG-001" in md
+    assert "abc123" in md
+
+
+def test_report_explanation_translates_simplified_dcf_raw_warnings():
+    val = _sample_valuation()
+    val["sensitivity"] = {
+        "simplified_dcf": {
+            "wacc_range": [0.08],
+            "g_range": [0.02],
+            "matrix": {"0.080": {"0.02": None}},
+            "warnings": [
+                "Simplified OCF-CAPEX DCF — using historical CAGR, not driver-based forecast.",
+                "Negative FCF in history: ['2022FY', '2024FY'] — CAGR-based projection unreliable; simplified DCF target unavailable.",
+                "FCF CAGR unavailable (start or end value <= 0); assuming 5% FCF growth",
+                "Terminal value weight 83.1% > 70% — sensitivity analysis required",
+                "Terminal value weight 76.3% > 70% — sensitivity analysis required",
+                "Terminal value weight 87.1% > 85% — DCF result highly unreliable",
+            ],
+        }
+    }
+
+    md = _build_explanation(valuation=val)
+
+    assert "Negative FCF" not in md
+    assert "Simplified OCF-CAPEX DCF" not in md
+    assert "CAGR-based" not in md
+    assert "FCF CAGR unavailable" not in md
+    assert "Terminal value weight" not in md
+    assert "sensitivity analysis required" not in md
+    assert "DCF result highly unreliable" not in md
+    assert "driver-based" not in md
+    assert "['2022FY', '2024FY']" not in md
+    assert "Dòng tiền tự do lịch sử âm trong các năm 2022FY và 2024FY" in md
+    assert "Không tính được tốc độ tăng trưởng kép của dòng tiền tự do" in md
+    assert "Giá trị cuối kỳ chiếm khoảng 76.3% đến 87.1% giá trị doanh nghiệp" in md
+    assert md.count("Giá trị cuối kỳ chiếm") == 1

@@ -80,6 +80,25 @@ def _sub(valuation: Mapping[str, Any], *keys: str) -> dict[str, Any]:
     return {}
 
 
+def _forecast_rows(forecast: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [row for row in forecast.get("forecast_years", []) if isinstance(row, Mapping)]
+
+
+def _has_forecast_rows(forecast: Mapping[str, Any]) -> bool:
+    return bool(_forecast_rows(forecast))
+
+
+def _effective_forecast(valuation: Mapping[str, Any], forecast: Mapping[str, Any]) -> dict[str, Any]:
+    """Prefer explicit forecast input, then fall back to the embedded valuation artifact."""
+    explicit = dict(forecast or {})
+    if _has_forecast_rows(explicit):
+        return explicit
+    embedded = valuation.get("forecast")
+    if isinstance(embedded, Mapping) and _has_forecast_rows(embedded):
+        return dict(embedded)
+    return explicit
+
+
 def _kv_table(rows: Sequence[tuple[str, str]]) -> str:
     lines = ["| Thành phần | Giá trị |", "| --- | ---: |"]
     lines.extend(f"| {label} | {value} |" for label, value in rows)
@@ -105,6 +124,18 @@ def _grid_table(
     return "\n".join([header, sep, *body])
 
 
+def _cell_price_value(value: Any) -> Any:
+    return value.get("price") if isinstance(value, Mapping) else value
+
+
+def _has_display_value(matrix: Sequence[Sequence[Any]]) -> bool:
+    for row in matrix:
+        for cell in row:
+            if _cell_price_value(cell) is not None:
+                return True
+    return False
+
+
 def _warnings_block(*artifacts: Mapping[str, Any]) -> list[str]:
     collected: list[str] = []
     for artifact in artifacts:
@@ -117,12 +148,78 @@ def _warnings_block(*artifacts: Mapping[str, Any]) -> list[str]:
 
 def _dedupe_warnings(items: Sequence[str]) -> list[str]:
     """Deduplicate translated warnings while preserving first-seen order."""
+    import re
+
     out: list[str] = []
+    terminal_weights: list[float] = []
+    terminal_insert_index: int | None = None
     for item in items:
         text = str(item or "").strip()
-        if text and text not in out:
+        if not text:
+            continue
+        match = re.match(r"Giá trị cuối kỳ chiếm (\d+(?:\.\d+)?)% giá trị doanh nghiệp", text)
+        if match:
+            terminal_weights.append(float(match.group(1)))
+            if terminal_insert_index is None:
+                terminal_insert_index = len(out)
+                out.append("__TERMINAL_VALUE_WEIGHT_SUMMARY__")
+            continue
+        if text not in out:
             out.append(text)
+    if terminal_weights and terminal_insert_index is not None:
+        lo = min(terminal_weights)
+        hi = max(terminal_weights)
+        if len(terminal_weights) == 1:
+            summary = (
+                f"Giá trị cuối kỳ chiếm {terminal_weights[0]:.1f}% giá trị doanh nghiệp, cao hơn ngưỡng 70%; "
+                "kết quả định giá rất nhạy với giả định tăng trưởng dài hạn và tỷ lệ chiết khấu."
+            )
+        else:
+            summary = (
+                f"Giá trị cuối kỳ chiếm khoảng {lo:.1f}% đến {hi:.1f}% giá trị doanh nghiệp trong các kịch bản DCF giản lược, "
+                "cao hơn ngưỡng 70%; kết quả định giá rất nhạy với giả định tăng trưởng dài hạn và tỷ lệ chiết khấu."
+            )
+        out[terminal_insert_index] = summary
     return out
+
+
+def _join_vietnamese_items(items: Sequence[Any]) -> str:
+    cleaned = [str(item).strip().strip("'\"") for item in items if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return ", ".join(cleaned[:-1]) + " và " + cleaned[-1]
+
+
+def _extract_list_items(text: str) -> list[str]:
+    import ast
+    import re
+
+    match = re.search(r"\[[^\]]*\]", text)
+    if not match:
+        return []
+    try:
+        parsed = ast.literal_eval(match.group(0))
+    except (SyntaxError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed]
+    return []
+
+
+def _method_label(value: Any) -> str:
+    key = str(value or "").strip()
+    labels = {
+        "fcff": "FCFF",
+        "fcfe": "FCFE",
+        "blend_dcf": "kết hợp FCFF/FCFE",
+        "blend": "kết hợp FCFF/FCFE",
+        "pe": "P/E",
+        "pe_forward": "P/E dự phóng",
+        "ev_ebitda": "EV/EBITDA",
+    }
+    return labels.get(key.lower(), key)
 
 
 def _view_model_evidence(vm: Any | None) -> dict[str, Any]:
@@ -137,8 +234,14 @@ def _evidence_value_label(value: Any) -> str:
         return "Giả định tạm thời của mô hình; chưa có bộ doanh nghiệp so sánh được phê duyệt."
     if key == "pending_peer_dataset":
         return "Đang chờ dữ liệu nhóm doanh nghiệp so sánh đã kiểm chứng."
+    if key == "peer_data_available":
+        return "Có dữ liệu nhóm doanh nghiệp so sánh để đối chiếu."
     if "peer" in normalized and "pending" in normalized:
         return "Đang chờ dữ liệu nhóm doanh nghiệp so sánh đã kiểm chứng."
+    if key.startswith("VN pharma peers:"):
+        return "Nhóm doanh nghiệp dược Việt Nam: " + key.split(":", 1)[1].strip()
+    if "served from cache" in normalized and "live fetch failed" in normalized:
+        return "Dữ liệu thị trường được lấy từ bản lưu tạm thời do nguồn cập nhật trực tiếp chưa phản hồi."
     return key
 
 
@@ -149,8 +252,8 @@ def _evidence_block(vm: Any | None) -> str:
     rows: list[tuple[str, str]] = []
     trace_count = evidence.get("formula_trace_count")
     if trace_count is not None:
-        methods = ", ".join(item for item in (evidence.get("formula_trace_methods") or []) if item) or _DASH
-        rows.append(("Số vết công thức", f"{trace_count} ({methods})"))
+        methods = ", ".join(_method_label(item) for item in (evidence.get("formula_trace_methods") or []) if item) or _DASH
+        rows.append(("Số bước tính có thể đối chiếu", f"{trace_count} ({methods})"))
     if evidence.get("peer_data_source"):
         rows.append(("Nguồn định giá tương đối đối chiếu", _evidence_value_label(evidence["peer_data_source"])))
     if evidence.get("relative_valuation_status"):
@@ -199,6 +302,99 @@ def _translate_warning(warning: Any) -> str:
     normalized = lower.replace("_", " ").replace("-", " ")
     if not text:
         return ""
+
+    list_items = _extract_list_items(text)
+    if "negative fcf in history" in normalized:
+        years = _join_vietnamese_items(list_items)
+        if years:
+            return (
+                f"Dòng tiền tự do lịch sử âm trong các năm {years}; vì vậy cách ngoại suy tăng trưởng dòng tiền "
+                "bằng tốc độ tăng trưởng kép không đủ tin cậy và chỉ nên dùng như kiểm tra tham khảo."
+            )
+        return "Dòng tiền tự do lịch sử âm; vì vậy kết quả DCF giản lược chỉ nên dùng như kiểm tra tham khảo."
+    if "fcf cagr unavailable" in normalized:
+        return (
+            "Không tính được tốc độ tăng trưởng kép của dòng tiền tự do vì giá trị đầu kỳ hoặc cuối kỳ không dương; "
+            "mô hình đang dùng giả định tăng trưởng dòng tiền tự do 5% để tham khảo."
+        )
+    if "cagr based projection unreliable" in normalized or "projection unreliable" in normalized:
+        return "Ngoại suy theo tốc độ tăng trưởng kép không đủ tin cậy; cần ưu tiên dự phóng theo yếu tố dẫn dắt."
+    if "terminal value weight" in normalized and ">" in normalized:
+        import re
+
+        match = re.search(r"(\d+(?:\.\d+)?)%", text)
+        threshold_match = re.search(r">\s*(\d+(?:\.\d+)?)%", text)
+        weight = f"{match.group(1)}%" if match else "trên 70%"
+        threshold = f"{threshold_match.group(1)}%" if threshold_match else "ngưỡng cảnh báo"
+        severity = (
+            "rất cao và làm kết quả DCF kém tin cậy"
+            if threshold_match and float(threshold_match.group(1)) >= 85
+            else "cao"
+        )
+        return (
+            f"Giá trị cuối kỳ chiếm {weight} giá trị doanh nghiệp, cao hơn ngưỡng {threshold}; "
+            f"mức phụ thuộc vào giá trị cuối kỳ {severity}, vì vậy cần kiểm tra kỹ giả định tăng trưởng dài hạn và tỷ lệ chiết khấu."
+        )
+    if "simplified ocf capex dcf" in normalized or "simplified ocf-capex dcf" in normalized:
+        return (
+            "DCF giản lược theo dòng tiền từ hoạt động kinh doanh trừ CAPEX chỉ là phép kiểm tra tham khảo; "
+            "định giá chính nên dựa trên FCFF/FCFE và phần kết hợp phương pháp."
+        )
+    if "served from cache" in normalized and "live fetch failed" in normalized:
+        return "Dữ liệu thị trường được lấy từ bản lưu tạm thời do nguồn cập nhật trực tiếp chưa phản hồi."
+    if "sg&a historical median did not reconcile to operating ebit" in normalized:
+        return (
+            "Biên chi phí bán hàng và quản lý lịch sử không khớp trực tiếp với EBIT hoạt động; "
+            "mô hình dùng biên EBIT hoạt động thuần được suy ra từ lợi nhuận hoạt động sau khi loại phần tài chính."
+        )
+    if "capex/revenue forecast starts from recent level" in normalized:
+        import re
+
+        values = re.findall(r"\d+(?:\.\d+)?%", text)
+        recent = values[0] if values else "mức gần nhất"
+        historical = values[1] if len(values) > 1 else "trung vị lịch sử"
+        return (
+            f"Tỷ lệ CAPEX/doanh thu dự phóng bắt đầu từ {recent} thay vì {historical}; "
+            "sau đó giảm dần về mức đầu tư duy trì theo khấu hao."
+        )
+    if "debt forecast uses cfs" in normalized or "[debtschedule]" in normalized:
+        import re
+
+        match = re.search(r"(\d+(?:\.\d+)?)% of revenue", text)
+        share = f"{match.group(1)}% doanh thu" if match else "một tỷ lệ doanh thu đã đối chiếu với dòng tiền"
+        return (
+            f"Lịch nợ vay dự phóng dùng lộ trình đòn bẩy đã đối chiếu với báo cáo lưu chuyển tiền tệ; "
+            f"dư nợ được giữ quanh {share}, còn vay ròng đi theo quy mô tăng trưởng kinh doanh."
+        )
+    if "cost of debt not derivable from debt schedule" in normalized:
+        return (
+            "Không suy ra được chi phí nợ trực tiếp từ lịch nợ do thiếu cặp dữ liệu lãi vay/dư nợ lịch sử; "
+            "mô hình tạm dùng tỷ lệ chi phí lãi vay trên doanh thu làm biến đại diện, với độ tin cậy thấp."
+        )
+    if "[workingcapital]" in normalized and "no historical inventory data" in normalized:
+        return (
+            "Thiếu dữ liệu tồn kho lịch sử để dự phóng vốn lưu động; mô hình giữ tồn kho dự phóng bằng 0, "
+            "nên cần đọc kết quả dòng tiền với mức thận trọng cao hơn."
+        )
+    if "[workingcapital]" in normalized and "no historical ap data" in normalized:
+        return (
+            "Thiếu dữ liệu phải trả người bán lịch sử để dự phóng vốn lưu động; phần thay đổi vốn lưu động "
+            "có thể bị ước tính cao hơn thực tế."
+        )
+    if "[workingcapital]" in normalized and "no historical ar data" in normalized:
+        return (
+            "Thiếu dữ liệu phải thu khách hàng lịch sử để dự phóng vốn lưu động; phần thay đổi vốn lưu động "
+            "có thể bị ước tính thấp hơn thực tế."
+        )
+    if "dividends_paid is negative" in lower or "dividends paid is negative" in normalized:
+        return (
+            "Cổ tức dự phóng mang dấu âm (dòng tiền ra); mô hình đã quy về giá trị tuyệt đối khi tính lịch tiền mặt."
+        )
+    if "[cashsweep]" in normalized or "cashsweepartifact" in normalized:
+        return (
+            "Chưa có số dư tiền cuối kỳ được báo cáo để đối chiếu cơ chế điều tiết tiền mặt; "
+            "khả năng hòa giải dòng tiền vẫn cần được kiểm tra thêm."
+        )
 
     direct_rules = {
         "no_eligible_valuation_method": "Thiếu phương pháp định giá chính đã được xác minh để làm cơ sở khuyến nghị.",
@@ -406,8 +602,15 @@ def _translate_warning(warning: Any) -> str:
         "net borrowing": "vay ròng",
         "working capital": "vốn lưu động",
         "artifact": "tệp kết quả",
+        "backend": "hệ thống xử lý nội bộ",
+        "database": "kho dữ liệu",
+        "driver-based": "theo yếu tố dẫn dắt",
+        "projection": "dự phóng",
+        "analysis": "phân tích",
         "forecast": "dự phóng",
         "warning": "cảnh báo",
+        "PENDING": "thiếu dữ liệu xác minh",
+        "BLOCKED": "thiếu dữ liệu",
         "blocked": "thiếu dữ liệu",
         "pending": "thiếu dữ liệu xác minh",
     }
@@ -419,29 +622,74 @@ def _translate_warning(warning: Any) -> str:
 
 # ── section renderers ─────────────────────────────────────────────────────────
 
-def _section_header(ticker: str, run_id: str, valuation: Mapping[str, Any], vm: Any) -> str:
+def _section_header(
+    ticker: str,
+    run_id: str,
+    valuation: Mapping[str, Any],
+    vm: Any,
+    *,
+    client_facing: bool = False,
+) -> str:
     company = getattr(vm, "company_name", None) or ticker
     exchange = getattr(vm, "exchange", None) or _DASH
     sector = getattr(vm, "sector", None) or _DASH
+    valuation_date = _first(valuation, "valuation_date", "snapshot_as_of", "generated_at")
+    period_scope = valuation.get("period_scope") if isinstance(valuation.get("period_scope"), Mapping) else {}
+    base_year = _first(valuation, "base_year") or period_scope.get("to_year")
+    if base_year is None:
+        fy_periods = valuation.get("fy_periods") or []
+        if fy_periods:
+            base_year = str(fy_periods[-1]).replace("FY", "")
     rows = [
         ("Mã cổ phiếu", ticker),
         ("Công ty", company),
         ("Sàn", exchange),
         ("Ngành", sector),
-        ("Mã lần chạy", run_id),
-        ("Ngày định giá", str(_first(valuation, "valuation_date") or _DASH)),
-        ("Mã ảnh chụp dữ liệu", str(_first(valuation, "snapshot_id") or _DASH)),
-        ("Năm gốc", str(_first(valuation, "base_year") or _DASH)),
-        ("Mã băm tái lập", str(_first(valuation, "reproducibility_hash") or _DASH)),
+        ("Ngày định giá", str(valuation_date or _DASH)[:10]),
+        ("Năm gốc", str(base_year or _DASH)),
     ]
+    if not client_facing:
+        rows.insert(4, ("Mã lần chạy", run_id))
+        rows.insert(6, ("Mã ảnh chụp dữ liệu", str(_first(valuation, "snapshot_id") or _DASH)))
+        rows.append(("Mã băm tái lập", str(_first(valuation, "reproducibility_hash") or _DASH)))
     return f"## {SECTION_TITLES[0]}\n\n" + _kv_table(rows)
 
 
 def _section_summary(valuation: Mapping[str, Any], blend: Mapping[str, Any], vm: Any) -> str:
-    current = _first(valuation, "current_price") or _first(blend, "current_price_vnd")
-    target = _first(valuation, "target_price") or _first(blend, "target_price_dcf_vnd")
-    upside = _first(valuation, "upside_downside") or _first(blend, "upside_pct")
-    recommendation = getattr(vm, "recommendation", None) or _DASH
+    pe_forward = _sub(valuation, "pe_forward")
+    core_pe = _sub(valuation, "core_pe_net_cash")
+    current = (
+        _vm_amount(getattr(vm, "current_price", None))
+        or _first(valuation, "current_price")
+        or _first(valuation, "current_price_vnd")
+        or _first(blend, "current_price_vnd")
+    )
+    target = (
+        _vm_amount(getattr(vm, "target_price", None))
+        or _first(valuation, "target_price")
+        or _first(blend, "target_price_dcf_vnd")
+        or _first(pe_forward, "price_pe_forward_vnd")
+        or _first(core_pe, "target_price_vnd")
+    )
+    upside = _vm_ratio(getattr(vm, "upside_downside", None))
+    if upside is None:
+        upside = (
+            _first(valuation, "upside_downside")
+            or _first(blend, "upside_pct")
+        )
+    if upside is None and current and target:
+        try:
+            upside = (float(target) - float(current)) / float(current)
+        except (TypeError, ValueError, ZeroDivisionError):
+            upside = None
+    recommendation = getattr(vm, "recommendation", None)
+    if not recommendation:
+        gate = valuation.get("assumption_gate") if isinstance(valuation.get("assumption_gate"), Mapping) else {}
+        recommendation = (
+            "Chưa công bố - cần phê duyệt của chuyên viên phân tích"
+            if gate.get("recommendation_allowed") is False
+            else _DASH
+        )
     rows = [
         ("Giá hiện tại (VND)", _num(current)),
         ("Giá mục tiêu kết hợp (VND)", _num(target)),
@@ -476,9 +724,12 @@ def _section_assumptions(valuation: Mapping[str, Any], fcff: Mapping[str, Any], 
 
 
 def _section_forecast(forecast: Mapping[str, Any]) -> str:
-    years = [r for r in forecast.get("forecast_years", []) if isinstance(r, Mapping)]
+    years = _forecast_rows(forecast)
     if not years:
-        return f"## {SECTION_TITLES[3]}\n\n_Không có dữ liệu dự phóng._"
+        return (
+            f"## {SECTION_TITLES[3]}\n\n"
+            "_Chưa có bảng dự phóng theo yếu tố dẫn dắt trong bộ dữ liệu đầu vào, nên phụ lục không tự suy diễn số liệu._"
+        )
     labels = [str(r.get("label") or _DASH) for r in years]
     metrics = [
         ("Doanh thu thuần", "revenue"),
@@ -552,9 +803,12 @@ def _section_forecast(forecast: Mapping[str, Any]) -> str:
 
 
 def _section_ratios(forecast: Mapping[str, Any]) -> str:
-    years = [r for r in forecast.get("forecast_years", []) if isinstance(r, Mapping)]
+    years = _forecast_rows(forecast)
     if not years:
-        return f"## {SECTION_TITLES[4]}\n\n_Không có dữ liệu để tính chỉ số._"
+        return (
+            f"## {SECTION_TITLES[4]}\n\n"
+            "_Chưa có bảng dự phóng theo yếu tố dẫn dắt để tính chỉ số tài chính; phụ lục giữ trống thay vì tự tạo số._"
+        )
     labels = [str(r.get("label") or _DASH) for r in years]
 
     def _ratio(num_key: str, den_key: str) -> list[str]:
@@ -743,18 +997,25 @@ def _section_blend(blend: Mapping[str, Any]) -> str:
 
 
 def _section_pe_forward(valuation: Mapping[str, Any]) -> str:
-    pe = _sub(valuation, "multiples", "pe_forward", "core_pe_net_cash")
+    pe = _sub(valuation, "pe_forward")
+    if not pe:
+        pe = _sub(valuation, "core_pe_net_cash")
+    if not pe:
+        pe = _sub(valuation, "multiples")
     if not pe:
         return (
             f"## {SECTION_TITLES[8]}\n\n"
             "_Không có tệp kết quả P/E dự phóng để đối chiếu._"
         )
+    peer_median = _first(pe, "peer_median_pe")
+    if peer_median is None and "peer" in str(pe.get("peer_data_source") or "").lower():
+        peer_median = _first(pe, "target_pe", "target_core_pe")
     rows: list[tuple[str, str]] = [
-        ("EPS dự phóng (VND)", _num(_first(pe, "eps_forward_vnd", "eps_forward"))),
-        ("P/E trung vị nhóm so sánh", _mult(_first(pe, "peer_median_pe"))),
+        ("EPS dự phóng (VND)", _num(_first(pe, "eps_forward_vnd", "eps_forward", "eps_fy1_vnd", "core_eps_vnd"))),
+        ("P/E trung vị nhóm so sánh", _mult(peer_median)),
         ("Mức cộng/trừ định giá", _pct(_first(pe, "premium_discount_pct"))),
-        ("P/E mục tiêu", _mult(_first(pe, "target_pe"))),
-        ("Giá mục tiêu (VND)", _num(_first(pe, "target_price_vnd"))),
+        ("P/E mục tiêu", _mult(_first(pe, "target_pe", "target_core_pe"))),
+        ("Giá mục tiêu (VND)", _num(_first(pe, "target_price_vnd", "price_pe_forward_vnd", "implied_price_pe"))),
     ]
     body = _kv_table(rows)
     peers = pe.get("peer_table") or []
@@ -791,7 +1052,18 @@ def _render_sensitivity_grid(name: str, grid: Mapping[str, Any]) -> str:
     col_axis = next((grid[k] for k in col_keys if grid.get(k)), fallback_cols)
 
     def _lookup(mapping: Mapping[str, Any], key: Any) -> Any:
-        candidates = (key, str(key), f"{float(key):.3f}", f"{float(key):.1f}")
+        try:
+            key_float = float(key)
+        except (TypeError, ValueError):
+            candidates = (key, str(key))
+        else:
+            candidates = (
+                key,
+                str(key),
+                f"{key_float:.3f}",
+                f"{key_float:.1f}",
+                str(int(round(key_float, 0))),
+            )
         for candidate in candidates:
             if candidate in mapping:
                 return mapping[candidate]
@@ -829,7 +1101,7 @@ def _render_sensitivity_grid(name: str, grid: Mapping[str, Any]) -> str:
         corner=str(label),
         row_fmt=row_fmt,
         col_fmt=col_fmt,
-        cell_fmt=lambda v: _num(v.get("price") if isinstance(v, Mapping) else v),
+        cell_fmt=lambda v: _num(_cell_price_value(v)),
     )
     formula = grid.get("formula")
     formula_vi = (
@@ -846,6 +1118,14 @@ def _render_sensitivity_grid(name: str, grid: Mapping[str, Any]) -> str:
         else ""
     )
     head = f"**{label}**" + (f" — `{formula_vi}`" if formula_vi else "")
+    if not _has_display_value(matrix):
+        warnings = _warnings_block(grid)
+        warning_text = "\n" + "\n".join(f"- {item}" for item in warnings) if warnings else ""
+        return (
+            head
+            + "\n\n_Không có ô định giá hợp lệ để hiển thị; mô hình giữ dấu gạch ngang thay vì tự suy diễn số._"
+            + warning_text
+        )
     return head + "\n\n" + table
 
 
@@ -873,6 +1153,7 @@ def _section_crosschecks(
     view_model: Any | None = None,
     *,
     include_evidence: bool = True,
+    client_facing: bool = False,
 ) -> str:
     lines = ["**Đối chiếu nhất quán số:**", ""]
     implied = _first(fcff, "implied_price", "target_price_vnd")
@@ -882,7 +1163,10 @@ def _section_crosschecks(
         flag = "✓" if match else "✗"
         lines.append(f"- {flag} Giá suy ra theo FCFF ({_num(implied)}) khớp giá FCFF trong kết quả kết hợp ({_num(price_fcff)}).")
     else:
-        lines.append("- Giá suy ra theo FCFF / giá FCFF: thiếu dữ liệu để đối chiếu (—).")
+        lines.append(
+            "- Chưa thể đối chiếu giá FCFF trong phần kết hợp vì một trong hai giá trị đầu vào chưa có kết quả hợp lệ; "
+            "người đọc cần ưu tiên phần cảnh báo phương pháp khi diễn giải giá mục tiêu."
+        )
 
     warnings = _warnings_block(blend, fcff, fcfe, valuation)
     lines.append("")
@@ -894,12 +1178,18 @@ def _section_crosschecks(
         lines.append("**Cảnh báo từ mô hình tính toán:** _không có._")
 
     lines.append("")
-    lines.append(f"**Mã băm tái lập:** `{_first(valuation, 'reproducibility_hash') or _DASH}`")
-    lines.append("")
-    lines.append(
-        "_Nguồn gốc dữ liệu: mọi số định giá được dẫn xuất từ dữ liệu tài chính chuẩn hóa đã khóa "
-        "và tệp kết quả định giá bằng Python; không có số liệu nào do mô hình ngôn ngữ sinh ra._"
-    )
+    if client_facing:
+        lines.append(
+            "_Nguồn gốc số liệu: các bảng định giá được tính từ dữ liệu tài chính đã chuẩn hóa và các giả định "
+            "được trình bày trong phụ lục; những ô không đủ điều kiện tính toán được giữ trống và giải thích bằng cảnh báo đi kèm._"
+        )
+    else:
+        lines.append(f"**Mã băm tái lập:** `{_first(valuation, 'reproducibility_hash') or _DASH}`")
+        lines.append("")
+        lines.append(
+            "_Nguồn gốc dữ liệu: mọi số định giá được dẫn xuất từ dữ liệu tài chính chuẩn hóa đã khóa "
+            "và tệp kết quả định giá bằng Python; không có số liệu nào do mô hình ngôn ngữ sinh ra._"
+        )
     if include_evidence:
         evidence = _evidence_block(view_model)
         if evidence:
@@ -977,7 +1267,7 @@ def _decision_narrative(
     """Explain blank target/recommendation outcomes from the available model facts."""
     if target is not None:
         return ""
-    years = [r for r in forecast.get("forecast_years", []) if isinstance(r, Mapping)]
+    years = _forecast_rows(forecast)
     steps: list[str] = []
     negative_ebit = any(
         (r.get("gross_profit") is not None and r.get("ebit") is not None)
@@ -1016,24 +1306,39 @@ def _section_report_decision_basis(
     issues: Sequence[Any],
 ) -> str:
     """Explain the main report conclusion before the calculation appendix."""
+    pe_forward = _sub(valuation, "pe_forward")
+    core_pe = _sub(valuation, "core_pe_net_cash")
     current = (
-        _first(valuation, "current_price")
+        _vm_amount(getattr(view_model, "current_price", None))
+        or _first(valuation, "current_price")
+        or _first(valuation, "current_price_vnd")
         or _first(blend, "current_price_vnd")
-        or _vm_amount(getattr(view_model, "current_price", None))
     )
     target = (
-        _first(valuation, "target_price")
+        _vm_amount(getattr(view_model, "target_price", None))
+        or _first(valuation, "target_price")
         or _first(blend, "target_price_dcf_vnd")
-        or _vm_amount(getattr(view_model, "target_price", None))
+        or _first(pe_forward, "price_pe_forward_vnd")
+        or _first(core_pe, "target_price_vnd")
     )
-    upside = (
-        _first(valuation, "upside_downside")
-        or _first(blend, "upside_pct")
-        or _vm_ratio(getattr(view_model, "upside_downside", None))
-    )
-    recommendation = getattr(view_model, "recommendation", None) or _DASH
+    upside = _vm_ratio(getattr(view_model, "upside_downside", None))
+    if upside is None:
+        upside = _first(valuation, "upside_downside") or _first(blend, "upside_pct")
+    if upside is None and current and target:
+        try:
+            upside = (float(target) - float(current)) / float(current)
+        except (TypeError, ValueError, ZeroDivisionError):
+            upside = None
+    recommendation = getattr(view_model, "recommendation", None)
+    if not recommendation:
+        gate = valuation.get("assumption_gate") if isinstance(valuation.get("assumption_gate"), Mapping) else {}
+        recommendation = (
+            "Chưa công bố - cần phê duyệt của chuyên viên phân tích"
+            if gate.get("recommendation_allowed") is False
+            else _DASH
+        )
     assumptions = _sub(valuation, "assumptions")
-    years = [r for r in forecast.get("forecast_years", []) if isinstance(r, Mapping)]
+    years = _forecast_rows(forecast)
     first_year = years[0] if years else {}
     last_year = years[-1] if years else {}
 
@@ -1107,7 +1412,7 @@ def build_valuation_workings_md(
     """Return the full valuation workings Markdown for *ticker* / *run_id*."""
     ticker = (ticker or "").upper()
     valuation = dict(valuation or {})
-    forecast = dict(forecast or {})
+    forecast = _effective_forecast(valuation, forecast)
 
     fcff = _sub(valuation, "fcff_dcf", "fcff")
     fcfe = _sub(valuation, "fcfe_dcf", "fcfe")
@@ -1142,6 +1447,76 @@ def build_valuation_workings_md(
     return title + "\n" + intro + "\n" + "\n\n".join(sections) + "\n"
 
 
+def _build_client_workings_md(
+    *,
+    ticker: str,
+    run_id: str,
+    valuation: Mapping[str, Any],
+    forecast: Mapping[str, Any],
+    view_model: Any | None = None,
+) -> str:
+    fcff = _sub(valuation, "fcff_dcf", "fcff")
+    fcfe = _sub(valuation, "fcfe_dcf", "fcfe")
+    blend = _sub(valuation, "blend", "blend_dcf")
+    sections = [
+        _section_header(ticker, run_id, valuation, view_model, client_facing=True),
+        _section_summary(valuation, blend, view_model),
+        _section_assumptions(valuation, fcff, fcfe),
+        _section_forecast(forecast),
+        _section_ratios(forecast),
+        _section_fcff(fcff),
+        _section_fcfe(fcfe),
+        _section_blend(blend),
+        _section_pe_forward(valuation),
+        _section_sensitivity(valuation),
+        _section_crosschecks(
+            valuation,
+            fcff,
+            blend,
+            fcfe,
+            view_model,
+            include_evidence=False,
+            client_facing=True,
+        ),
+    ]
+    intro = (
+        "> Phần này trình bày đầy đủ công thức, dữ liệu đầu vào, bước tính trung gian, bảng dự phóng, "
+        "cầu nối định giá, phân tích độ nhạy và cảnh báo để người đọc kiểm tra lại kết quả trong báo cáo chính."
+    )
+    return "## Chi tiết tính toán định giá\n\n" + intro + "\n\n" + "\n\n".join(sections) + "\n"
+
+
+def _validate_client_workings_preflight(
+    *,
+    valuation: Mapping[str, Any],
+    forecast: Mapping[str, Any],
+    markdown: str,
+) -> None:
+    required_sections = [
+        "## Vì sao báo cáo chính kết luận như vậy",
+        "## Chi tiết tính toán định giá",
+        f"## {SECTION_TITLES[3]}",
+        f"## {SECTION_TITLES[4]}",
+        f"## {SECTION_TITLES[5]}",
+    ]
+    missing = [section for section in required_sections if section not in markdown]
+    if missing:
+        raise ValueError(
+            "Phụ lục giải trình chưa đủ các mục bắt buộc: "
+            + "; ".join(section.removeprefix("## ") for section in missing)
+        )
+
+    embedded = valuation.get("forecast")
+    valuation_has_forecast = isinstance(embedded, Mapping) and _has_forecast_rows(embedded)
+    if (_has_forecast_rows(forecast) or valuation_has_forecast) and (
+        "Không có dữ liệu dự phóng" in markdown
+        or "Chưa có bảng dự phóng theo yếu tố dẫn dắt" in markdown
+    ):
+        raise ValueError(
+            "Bộ dữ liệu định giá có dữ liệu dự phóng nhưng phụ lục giải trình không render được bảng dự phóng."
+        )
+
+
 def build_report_explanation_md(
     *,
     ticker: str,
@@ -1154,7 +1529,7 @@ def build_report_explanation_md(
     """Build a client-facing valuation appendix with full deterministic workings."""
     ticker = (ticker or "").upper()
     valuation = dict(valuation or {})
-    forecast = dict(forecast or {})
+    forecast = _effective_forecast(valuation, forecast)
     fcff = _sub(valuation, "fcff_dcf", "fcff")
     fcfe = _sub(valuation, "fcfe_dcf", "fcfe")
     blend = _sub(valuation, "blend", "blend_dcf")
@@ -1192,7 +1567,6 @@ def build_report_explanation_md(
         "## Trạng thái và giới hạn",
         "",
         f"- Trạng thái báo cáo: **{status}**",
-        f"- Mã lần chạy: `{run_id}`",
     ]
     if status_issues:
         status_lines.extend(f"- {_issue_label(issue)}" for issue in status_issues)
@@ -1212,35 +1586,24 @@ def build_report_explanation_md(
         status_issues,
     )
     analysis_findings = _section_analysis_findings(critic_findings)
-    workings = build_valuation_workings_md(
+    workings = _build_client_workings_md(
         ticker=ticker,
         run_id=run_id,
         valuation=valuation,
         forecast=forecast,
-        facts=facts,
         view_model=view_model,
-        include_crosscheck_evidence=False,
-    )
-    workings = workings.replace(
-        "# Diễn giải định giá — " + ticker,
-        "## Chi tiết tính toán định giá",
-        1,
-    )
-    workings = workings.replace(
-        "> Tài liệu nội bộ để kiểm định. Trình bày đầy đủ công thức, dữ liệu đầu vào và bước "
-        "trung gian của từng phép tính định giá. KHÔNG phải báo cáo khách hàng.",
-        (
-            "> Phần này trình bày đầy đủ công thức, dữ liệu đầu vào, bước tính trung gian, "
-            "bảng dự phóng, cầu nối định giá, phân tích độ nhạy và cảnh báo để người đọc "
-            "kiểm tra lại kết quả trong báo cáo chính."
-        ),
-        1,
     )
     blocks = ["\n".join(status_lines), decision_basis]
     if analysis_findings:
         blocks.append(analysis_findings)
     blocks.append(workings)
-    return "\n\n".join(blocks)
+    markdown = "\n\n".join(blocks)
+    _validate_client_workings_preflight(
+        valuation=valuation,
+        forecast=forecast,
+        markdown=markdown,
+    )
+    return markdown
 
 
 def load_workings_inputs(run_id: str) -> dict[str, Any]:
